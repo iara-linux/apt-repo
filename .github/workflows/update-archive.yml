@@ -72,17 +72,24 @@ jobs:
             fi
           done
 
-      - name: Push pool (additive, long cache)
+      - name: Push pool
         if: steps.fetch.outputs.count != '0'
         run: |
           rclone copy pool/ "r2:$PUBLIC_BUCKET/pool/" \
             --header-upload "Cache-Control: public, max-age=31536000, immutable"
 
-      - name: Push indices (after pool, so nothing dangles)
-        if: steps.fetch.outputs.count != '0'
+      - name: Push indices
         run: |
           rclone sync dists/ "r2:$PUBLIC_BUCKET/dists/" \
-            --header-upload "Cache-Control: public, max-age=60, must-revalidate"
+            --exclude "/$CODENAME/Release" \
+            --exclude "/$CODENAME/Release.gpg" \
+            --exclude "/$CODENAME/InRelease" \
+            --header-upload "Cache-Control: no-store"
+          rclone copy dists/ "r2:$PUBLIC_BUCKET/dists/" \
+            --include "/$CODENAME/Release" \
+            --include "/$CODENAME/Release.gpg" \
+            --include "/$CODENAME/InRelease" \
+            --header-upload "Cache-Control: no-store"
 
       - name: Reap pool files reprepro dropped
         if: steps.fetch.outputs.count != '0'
