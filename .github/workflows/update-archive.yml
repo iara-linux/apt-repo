@@ -52,10 +52,14 @@ jobs:
           rclone copy "r2:$PUBLIC_BUCKET/dists"  dists/
           rclone copy "r2:$PUBLIC_BUCKET/pool"   pool/
 
+      - name: Verify pool pull is complete
+        run: rclone check "r2:$PUBLIC_BUCKET/pool" pool/ --one-way --size-only
+
       - name: Fetch incoming packages
         id: fetch
         run: |
-          rclone copy "r2:$INCOMING_BUCKET" incoming/ --include "*.deb"
+          rclone copy "r2:$INCOMING_BUCKET" incoming/ \
+            --include "*.deb" --exclude "rejected/**"
           count=$(find incoming -name '*.deb' | wc -l)
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Found $count package(s)"
@@ -78,8 +82,11 @@ jobs:
       - name: Push pool
         if: steps.fetch.outputs.count != '0'
         run: |
-          rclone copy pool/ "r2:$PUBLIC_BUCKET/pool/" \
-            --header-upload "Cache-Control: public, max-age=31536000, immutable"
+          rclone copy pool/ "r2:$PUBLIC_BUCKET/pool/"
+
+      - name: Verify pool landed
+        if: steps.fetch.outputs.count != '0'
+        run: rclone check pool/ "r2:$PUBLIC_BUCKET/pool/" --one-way --size-only
 
       - name: Push indices
         if: steps.fetch.outputs.count != '0'
@@ -97,9 +104,7 @@ jobs:
 
       - name: Reap pool files reprepro dropped
         if: steps.fetch.outputs.count != '0'
-        run: |
-          rclone sync pool/ "r2:$PUBLIC_BUCKET/pool/" \
-            --header-upload "Cache-Control: public, max-age=31536000, immutable"
+        run: rclone sync pool/ "r2:$PUBLIC_BUCKET/pool/"
 
       - name: Save reprepro database
         if: steps.fetch.outputs.count != '0'
