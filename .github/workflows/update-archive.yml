@@ -1,6 +1,8 @@
 name: Update archive with incoming packages
 
 on:
+  repository_dispatch:
+    types: [apt-sync]
   workflow_dispatch:
   schedule:
     - cron: "45 * * * *"
