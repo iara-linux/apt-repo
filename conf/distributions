@@ -1,0 +1,10 @@
+Origin: Iara Linux
+Label: Iara Linux
+Codename: trixie
+Suite: stable
+Architectures: arm64
+Components: main
+Description: Packages for Amazon Echo devices
+SignWith: C48E126B54D7C70A4DA2638EEEED5D4EFD4290EC
+DebIndices: Packages Release . .gz .xz
+ByHash: yes

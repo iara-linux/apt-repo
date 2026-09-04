@@ -1,0 +1,115 @@
+name: Update archive with incoming packages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 * * * *"
+
+concurrency:
+  group: apt-sync
+  cancel-in-progress: false
+
+env:
+  CODENAME: trixie
+  PUBLIC_BUCKET: iara-linux-apt
+  INCOMING_BUCKET: iara-linux-apt-incoming
+  STATE_BUCKET: iara-linux-apt-state
+  RCLONE_CONFIG_R2_TYPE: s3
+  RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+  RCLONE_CONFIG_R2_REGION: auto
+  RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+  RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.APT_SIGNING_KEY }}
+          passphrase: ${{ secrets.APT_SIGNING_KEY_PASSPHRASE }}
+
+      - name: Verify agent is primed
+        run: echo test | gpg --batch --yes --clearsign > /dev/null
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y reprepro rclone
+
+      - name: Pull existing repository state
+        run: |
+          mkdir -p db dists pool incoming
+          rclone copy "r2:$STATE_BUCKET/db"      db/
+          rclone copy "r2:$PUBLIC_BUCKET/dists"  dists/
+          rclone copy "r2:$PUBLIC_BUCKET/pool"   pool/
+
+      - name: Fetch incoming packages
+        id: fetch
+        run: |
+          rclone copy "r2:$INCOMING_BUCKET" incoming/ --include "*.deb"
+          count=$(find incoming -name '*.deb' | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Found $count package(s)"
+
+      - name: Ingest packages
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          set -uo pipefail
+          : > accepted.txt
+          : > rejected.txt
+          for deb in incoming/*.deb; do
+            if reprepro -b . --waitforlock 30 includedeb "$CODENAME" "$deb"; then
+              basename "$deb" >> accepted.txt
+            else
+              echo "::error::reprepro rejected $(basename "$deb")"
+              basename "$deb" >> rejected.txt
+            fi
+          done
+
+      - name: Push pool (additive, long cache)
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          rclone copy pool/ "r2:$PUBLIC_BUCKET/pool/" \
+            --header-upload "Cache-Control: public, max-age=31536000, immutable"
+
+      - name: Push indices (after pool, so nothing dangles)
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          rclone sync dists/ "r2:$PUBLIC_BUCKET/dists/" \
+            --header-upload "Cache-Control: public, max-age=60, must-revalidate"
+
+      - name: Reap pool files reprepro dropped
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          rclone sync pool/ "r2:$PUBLIC_BUCKET/pool/" \
+            --header-upload "Cache-Control: public, max-age=31536000, immutable"
+
+      - name: Save reprepro database
+        if: steps.fetch.outputs.count != '0'
+        run: rclone sync db/ "r2:$STATE_BUCKET/db/"
+
+      - name: Clear the incoming bucket
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          while read -r f; do
+            [ -n "$f" ] && rclone deletefile "r2:$INCOMING_BUCKET/$f"
+          done < accepted.txt
+          # Park failures out of the way so they don't wedge every future run.
+          while read -r f; do
+            [ -n "$f" ] && rclone moveto "r2:$INCOMING_BUCKET/$f" "r2:$INCOMING_BUCKET/rejected/$f"
+          done < rejected.txt
+
+      - name: Fail if anything was rejected
+        if: steps.fetch.outputs.count != '0'
+        run: |
+          if [ -s rejected.txt ]; then
+            echo "Rejected packages (moved to rejected/ in the incoming bucket):"
+            cat rejected.txt
+            exit 1
+          fi
