@@ -1,0 +1,86 @@
+name: Delete package from repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package name to remove"
+        required: true
+concurrency:
+  group: apt-sync
+  cancel-in-progress: false
+
+env:
+  CODENAME: trixie
+  PUBLIC_BUCKET: iara-linux-apt
+  INCOMING_BUCKET: iara-linux-apt-incoming
+  STATE_BUCKET: iara-linux-apt-state
+  RCLONE_CONFIG_R2_TYPE: s3
+  RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+  RCLONE_CONFIG_R2_REGION: auto
+  RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+  RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.APT_SIGNING_KEY }}
+          passphrase: ${{ secrets.APT_SIGNING_KEY_PASSPHRASE }}
+
+      - name: Verify agent is primed
+        run: echo test | gpg --batch --yes --clearsign > /dev/null
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y reprepro rclone
+
+      - name: Pull existing repository state
+        run: |
+          mkdir -p db dists pool incoming
+          rclone copy "r2:$STATE_BUCKET/db"      db/
+          rclone copy "r2:$PUBLIC_BUCKET/dists"  dists/
+          rclone copy "r2:$PUBLIC_BUCKET/pool"   pool/
+
+      - name: Verify pool pull is complete
+        run: rclone check "r2:$PUBLIC_BUCKET/pool" pool/ --one-way --size-only
+
+      - name: Delete package
+        run: |
+          reprepro -b . --waitforlock 30 remove "$CODENAME" ${{ github.event.inputs.package }}
+          reprepro -b . deleteunreferenced
+
+      - name: Push pool
+        run: |
+          rclone copy pool/ "r2:$PUBLIC_BUCKET/pool/"
+
+      - name: Verify pool landed
+        run: rclone check pool/ "r2:$PUBLIC_BUCKET/pool/" --one-way --size-only
+
+      - name: Push indices
+        run: |
+          rclone sync dists/ "r2:$PUBLIC_BUCKET/dists/" \
+            --exclude "/$CODENAME/Release" \
+            --exclude "/$CODENAME/Release.gpg" \
+            --exclude "/$CODENAME/InRelease" \
+            --header-upload "Cache-Control: no-store"
+          rclone copy dists/ "r2:$PUBLIC_BUCKET/dists/" \
+            --include "/$CODENAME/Release" \
+            --include "/$CODENAME/Release.gpg" \
+            --include "/$CODENAME/InRelease" \
+            --header-upload "Cache-Control: no-store"
+
+      - name: Reap pool files reprepro dropped
+        run: rclone sync pool/ "r2:$PUBLIC_BUCKET/pool/"
+
+      - name: Save reprepro database
+        run: rclone sync db/ "r2:$STATE_BUCKET/db/"
